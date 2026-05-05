@@ -116,14 +116,6 @@ void print_graph_stats(const CSRGraph& g) {
 }
 
 // Label Propagation Algorithm (LPA) for community detection.
-//
-// Each node starts with a unique label (its own ID).
-// In each iteration, every node adopts the label most common among its
-// neighbors (weighted by edge weight). Ties are broken randomly.
-// Updates are synchronous: all nodes read old labels, write to new_labels,
-// then swap — this is the synchronous variant of LPA.
-// Stops early if no label changes in a full iteration.
-//
 // Returns a vector where labels[v] = community ID for node v.
 std::vector<int> label_propagation(const CSRGraph& g, int max_iter = 100,
                                     unsigned seed = 42, int debug_node_count = 3) {
@@ -214,7 +206,6 @@ int main(int argc, char** argv) {
     print_graph_stats(g);
 
     // Run LPA with multiple random seeds and keep the result with fewest communities
-    // (fewer communities = more consolidated, often better quality)
     int best_count = std::numeric_limits<int>::max();
     std::vector<int> best_labels;
 

@@ -121,12 +121,6 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
     changed_flags.forAllElements(
         [] __cuda_callable__ (int i, int& value) { value = 0; });
 
-    // FIX A: Get views ONCE before the loop for arrays that never reallocate.
-    // labels and new_labels are never resized — we only write into them
-    // in-place, so their underlying pointers are stable for the entire run.
-    // We do NOT use `labels = new_labels` (operator= may reallocate on Host).
-    // Instead we copy element-wise via forElements on new_labels, writing
-    // into labels's memory — guaranteed no reallocation, no pointer movement.
     auto labels_view     = labels.getView();
     auto new_labels_view = new_labels.getView();
     auto changed_view    = changed_flags.getView();
@@ -147,10 +141,6 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
                     changed_view[v]    = 0;
                     return;
                 }
-                // GPU kernels cannot use dynamic allocation (no std::vector, no new).
-                // We need per-thread scratch space to accumulate label scores, but the
-                // number of distinct neighbor labels is only known at runtime.
-                // Solution: fixed stack array with a compile-time upper bound.                
                 const int MAX_LOCAL_LABELS = 1024;
                 int   label_ids   [MAX_LOCAL_LABELS];
                 float label_scores[MAX_LOCAL_LABELS];
@@ -195,14 +185,8 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
                 changed_view[v]    = (best_label != labels_view[v]) ? 1 : 0;
             });
 
-        // FIX B: Count changes BEFORE updating labels, while changed_view is
-        // still valid. Use the simple array-based reduce form confirmed in docs.
         int total_changed = TNL::Algorithms::reduce(changed_flags, TNL::Plus{});
 
-        // FIX C: Copy new_labels -> labels IN PLACE using forElements.
-        // This writes into the existing labels memory — no reallocation,
-        // no pointer movement, labels_view remains valid for the next iter.
-        // This is the key fix vs operator= which may reallocate on Host.
         labels.forAllElements(
             [=] __cuda_callable__ (int i, int& value) {
                 value = new_labels_view[i];
