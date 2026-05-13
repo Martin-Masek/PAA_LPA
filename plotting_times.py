@@ -24,7 +24,6 @@ cpu_times = cpu_times[:n]
 cuda_times = cuda_times[:n]
 
 # Plot side-by-side bar chart
-# ... (loading logic remains the same)
 
 # 1. Define your step size
 step = 50000

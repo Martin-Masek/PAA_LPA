@@ -113,7 +113,6 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
     TNL::Containers::Array<int, Device> changed_flags(n);
 
     // Initialize: each node is its own community.
-    // forAllElements is confirmed safe for both Host and Cuda by the docs.
     labels.forAllElements(
         [] __cuda_callable__ (int i, int& value) { value = i; });
     new_labels.forAllElements(
@@ -130,7 +129,6 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
 
         // labels_view  = read-only source for this iteration (neighbours read this)
         // new_labels_view = write target (each node writes its new label here)
-        // Both views are stable — no reallocation happens below.
         TNL::Algorithms::parallelFor<Device>(0, n,
             [=] __cuda_callable__ (int v) mutable {
                 auto row   = matrix_view.getRow(v);
