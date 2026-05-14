@@ -4,8 +4,7 @@
 #include <vector>
 #include <map>
 #include <unordered_map>
-#include <queue>
-#include <chrono> 
+#include <chrono>
 
 #include <TNL/Matrices/SparseMatrix.h>
 #include <TNL/Devices/Host.h>
@@ -56,7 +55,7 @@ GraphMatrix<Device> load_to_tnl_matrix(const std::string& path, bool weighted = 
     }
 
     IndexType n_nodes = next_id;
-    std::cout << "Loaded " << n_nodes << " nodes\n";
+    std::cerr << "Loaded " << n_nodes << " nodes\n";
 
     std::sort(edges.begin(), edges.end());
     edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
@@ -78,59 +77,47 @@ GraphMatrix<Device> load_to_tnl_matrix(const std::string& path, bool weighted = 
         row.setElement(cursor[u]++, v, w);
     }
 
-    std::cout << "Transferring graph to device...\n";
+    std::cerr << "Transferring graph to device...\n";
     GraphMatrix<Device> device_matrix;
     device_matrix = host_matrix;
     return device_matrix;
 }
 
-void checksum_matrix(const GraphMatrix<TNL::Devices::Host>& m) {
-    long long neighbor_sum = 0, edge_count = 0;
-    for (int v = 0; v < m.getRows(); v++) {
-        auto row = m.getRow(v);
-        for (int i = 0; i < row.getSize(); i++) {
-            if (row.getValue(i) == 0.0f) continue;
-            neighbor_sum += row.getColumnIndex(i);
-            edge_count++;
-        }
-    }
-    std::cout << "=== GRAPH CHECKSUM ===\n";
-    std::cout << "  Nodes:        " << m.getRows() << "\n";
-    std::cout << "  Edges:        " << edge_count / 2 << "\n";
-    std::cout << "  Neighbor sum: " << neighbor_sum << "\n";
-    std::cout << "======================\n";
-}
+struct BenchResult {
+    int    max_local_labels;
+    double time_seconds;
+    int    num_communities;
+    int    iterations_done;
+    int    final_changed;
+};
 
-// ─── LPA ─────────────────────────────────────────────────────────────────────
-
-template<typename Device>
-TNL::Containers::Array<int, TNL::Devices::Host>
-run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
+template<typename Device, int MAX_LABELS>
+BenchResult run_lpa_bench(GraphMatrix<Device>& matrix, int max_iter = 1000) {
     int n = matrix.getRows();
 
     TNL::Containers::Array<int, Device> labels(n);
     TNL::Containers::Array<int, Device> new_labels(n);
     TNL::Containers::Array<int, Device> changed_flags(n);
 
-    // Initialize: each node is its own community.
-    // forAllElements is confirmed safe for both Host and Cuda by the docs.
     labels.forAllElements(
-        [] __cuda_callable__ (int i, int& value) { value = i; });
+        [] __cuda_callable__ (int i, int& v) { v = i; });
     new_labels.forAllElements(
-        [] __cuda_callable__ (int i, int& value) { value = i; });
+        [] __cuda_callable__ (int i, int& v) { v = i; });
     changed_flags.forAllElements(
-        [] __cuda_callable__ (int i, int& value) { value = 0; });
+        [] __cuda_callable__ (int i, int& v) { v = 0; });
 
     auto labels_view     = labels.getView();
     auto new_labels_view = new_labels.getView();
     auto changed_view    = changed_flags.getView();
     auto matrix_view     = matrix.getView();
 
-    for (int iter = 0; iter < max_iter; iter++) {
+    cudaDeviceSynchronize();
+    auto t_start = std::chrono::high_resolution_clock::now();
 
-        // labels_view  = read-only source for this iteration (neighbours read this)
-        // new_labels_view = write target (each node writes its new label here)
-        // Both views are stable — no reallocation happens below.
+    int iterations_done = 0;
+    int final_changed   = n;
+
+    for (int iter = 0; iter < max_iter; iter++) {
         TNL::Algorithms::parallelFor<Device>(0, n,
             [=] __cuda_callable__ (int v) mutable {
                 auto row   = matrix_view.getRow(v);
@@ -141,9 +128,9 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
                     changed_view[v]    = 0;
                     return;
                 }
-                const int MAX_LOCAL_LABELS = 32;
-                int   label_ids   [MAX_LOCAL_LABELS];
-                float label_scores[MAX_LOCAL_LABELS];
+
+                int   label_ids   [MAX_LABELS];
+                float label_scores[MAX_LABELS];
                 int   num_labels = 0;
 
                 for (int i = 0; i < degree; i++) {
@@ -157,15 +144,13 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
                     }
                     if (idx >= 0) {
                         label_scores[idx] += weight;
-                    } else if (num_labels < MAX_LOCAL_LABELS) {
+                    } else if (num_labels < MAX_LABELS) {
                         label_ids   [num_labels] = lbl;
                         label_scores[num_labels] = weight;
                         num_labels++;
                     }
                 }
 
-                // Deterministic tie-breaking with iter in hash so it varies
-                // each round — prevents oscillation / non-convergence.
                 int   best_label = labels_view[v];
                 float best_score = -1.0f;
 
@@ -185,69 +170,80 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
                 changed_view[v]    = (best_label != labels_view[v]) ? 1 : 0;
             });
 
-        int total_changed = TNL::Algorithms::reduce(changed_flags, TNL::Plus{});
+        final_changed = TNL::Algorithms::reduce(changed_flags, TNL::Plus{});
 
         labels.forAllElements(
             [=] __cuda_callable__ (int i, int& value) {
                 value = new_labels_view[i];
             });
 
-        if (iter % 10 == 0 || total_changed == 0) {
-            std::cout << "Iteration " << iter << ": " << total_changed << " nodes changed.\n";
-        }
-
-        if (total_changed == 0) break;
+        iterations_done = iter + 1;
+        if (final_changed == 0) break;
     }
+
+    cudaDeviceSynchronize();
+    auto t_end = std::chrono::high_resolution_clock::now();
 
     TNL::Containers::Array<int, TNL::Devices::Host> host_labels;
     host_labels = labels;
-    return host_labels;
-}
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+    std::unordered_map<int,int> comm_map;
+    int n_comm = 0;
+    for (int i = 0; i < host_labels.getSize(); i++)
+        if (!comm_map.count(host_labels[i]))
+            comm_map[host_labels[i]] = n_comm++;
+
+    return BenchResult{
+        MAX_LABELS,
+        std::chrono::duration<double>(t_end - t_start).count(),
+        n_comm,
+        iterations_done,
+        final_changed
+    };
+}
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cout << "Usage: ./tlpa <edge_list_file> [max_rows]\n";
+        std::cerr << "Usage: ./bench_max_labels <edge_list_file> [max_nodes] [max_iter]\n";
         return 1;
     }
 
-    std::string input_file = argv[1];
+    int max_nodes = (argc >= 3) ? std::stoi(argv[2]) : -1;
+    int max_iter  = (argc >= 4) ? std::stoi(argv[3]) : 1000;
 
-    int max_rows = -1;
-    if (argc >= 3)
-        max_rows = std::stoi(argv[2]);
     try {
-        using TargetDevice = TNL::Devices::Cuda;
+        using Device = TNL::Devices::Cuda;
+        auto matrix = load_to_tnl_matrix<Device>(argv[1], false, max_nodes);
 
-        auto matrix = load_to_tnl_matrix<TargetDevice>(argv[1], false, max_rows);
+        std::cout << "max_labels,time_s,communities,iterations,final_changed\n";
+        std::cout.flush();
 
-        GraphMatrix<TNL::Devices::Host> host_matrix;
-        host_matrix = matrix;
-        checksum_matrix(host_matrix);
+        auto print = [](const BenchResult& r) {
+            std::cerr << "  MAX_LABELS=" << r.max_local_labels
+                      << "  time=" << r.time_seconds << "s"
+                      << "  comms=" << r.num_communities
+                      << "  iters=" << r.iterations_done
+                      << "  remaining=" << r.final_changed << "\n";
+            std::cout << r.max_local_labels << ","
+                      << r.time_seconds    << ","
+                      << r.num_communities << ","
+                      << r.iterations_done << ","
+                      << r.final_changed   << "\n";
+            std::cout.flush();
+        };
 
-        std::cout << "Nodes: " << matrix.getRows() << "\n";
-        std::cout << "Cols:  " << matrix.getColumns() << "\n";
+#define RUN(N) { std::cerr << "Running MAX_LABELS=" #N "...\n"; print(run_lpa_bench<Device, N>(matrix, max_iter)); }
+        RUN(4)
+        RUN(8)
+        RUN(16)
+        RUN(32)
+        RUN(64)
+        RUN(128)
+        RUN(256)
+        RUN(512)
+        RUN(1024)
+#undef RUN
 
-        auto start = std::chrono::high_resolution_clock::now();
-
-        auto labels = run_lpa(matrix);
-
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
-
-        std::unordered_map<int,int> comm_map;
-        int n_comm = 0;
-        for (int i = 0; i < labels.getSize(); i++)
-            if (comm_map.find(labels[i]) == comm_map.end())
-                comm_map[labels[i]] = n_comm++;
-
-        std::cout << "RESULT "
-                << matrix.getRows() << " "
-                << n_comm << " "
-                << elapsed.count()
-                << std::endl;
-                
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << "\n";
         return 1;
