@@ -2,7 +2,7 @@ import sys
 import pandas as pd
 import matplotlib.pyplot as plt
 
-filename = sys.argv[1] if len(sys.argv) > 1 else "bench_max_labels.csv"
+filename = sys.argv[1] if len(sys.argv) > 1 else "bench_max_labels_citeseer.csv"
 
 df = pd.read_csv(filename)
 
