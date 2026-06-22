@@ -127,7 +127,7 @@ void print_graph_stats(const CSRGraph& g) {
 //
 // Complexity: O(max_iter × m)  where m = number of edges
 // ---------------------------------------------------------------------------
-std::vector<int> label_propagation(const CSRGraph& g, int max_iter = 100,
+std::vector<int> label_propagation(const CSRGraph& g, int max_iter = 1000,
                                     unsigned seed = 42) {
     std::vector<int> labels(g.n_nodes);
     std::iota(labels.begin(), labels.end(), 0);   // labels[v] = v
@@ -232,7 +232,7 @@ int main(int argc, char** argv) {
     print_graph_stats(g);
 
     auto t0     = std::chrono::high_resolution_clock::now();
-    auto labels = label_propagation(g, 100, 42);
+    auto labels = label_propagation(g, 1000, 11);
     auto t1     = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = t1 - t0;
 

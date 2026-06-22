@@ -141,7 +141,7 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
                     changed_view[v]    = 0;
                     return;
                 }
-                const int MAX_LOCAL_LABELS = 32;
+                const int MAX_LOCAL_LABELS = 256;
                 int   label_ids   [MAX_LOCAL_LABELS];
                 float label_scores[MAX_LOCAL_LABELS];
                 int   num_labels = 0;
@@ -177,8 +177,8 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
                                ^ (unsigned(label_ids[i]) * 2246822519u)
                                ^ (unsigned(iter)         * 1234567891u);
                     float final_score = label_scores[i] + (float)(h & 0xFFFF) / 1e7f;
-                    if (label_ids[i] == labels_view[v])
-                        final_score += 0.5f;
+                    // if (label_ids[i] == labels_view[v])
+                    //     final_score += 0.5f;
 
                     if (final_score > best_score) {
                         best_score = final_score;
