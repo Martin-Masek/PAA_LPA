@@ -1,0 +1,17 @@
+.paa_venv/
+grafy/
+tnl/
+old/
+*.o
+*.nsys-rep
+*.sqlite
+gmon.out
+lpa_orig
+lpa_opt
+lpa_prof
+tlpa_cuda
+tlpa_frontier
+tlpa_ellpack
+cputnl
+cputnlc
+bench_max_labels
