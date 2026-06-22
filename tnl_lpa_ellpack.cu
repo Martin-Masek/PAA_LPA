@@ -5,7 +5,7 @@
 #include <map>
 #include <unordered_map>
 #include <queue>
-#include <chrono> 
+#include <chrono>
 
 #include <TNL/Matrices/SparseMatrix.h>
 #include <TNL/Devices/Host.h>
@@ -13,15 +13,24 @@
 #include <TNL/Containers/Array.h>
 #include <TNL/Algorithms/parallelFor.h>
 #include <TNL/Algorithms/reduce.h>
+#include <TNL/Algorithms/Segments/BiEllpack.h>
 
 using RealType  = float;
 using IndexType = int;
 
-template<typename Device>
-using GraphMatrix = TNL::Matrices::SparseMatrix<RealType, Device, IndexType>;
+// Host-side loading always uses CSR — SlicedEllpack::setRowCapacities calls
+// TNL::sum internally which is not defined for Host arrays in this TNL build.
+using HostMatrix = TNL::Matrices::SparseMatrix<RealType, TNL::Devices::Host, IndexType>;
 
-template<typename Device>
-GraphMatrix<Device> load_to_tnl_matrix(const std::string& path, bool weighted = false, int max_nodes = -1) {
+// Device matrix uses BiEllpack: sorts rows within each warp-sized slice by
+// degree before padding, so high- and low-degree nodes are grouped together.
+// This minimises padding waste on power-law graphs compared to SlicedEllpack.
+using DeviceMatrix = TNL::Matrices::SparseMatrix<
+    RealType, TNL::Devices::Cuda, IndexType,
+    TNL::Matrices::GeneralMatrix,
+    TNL::Algorithms::Segments::BiEllpack>;
+
+DeviceMatrix load_to_tnl_matrix(const std::string& path, bool weighted = false, int max_nodes = -1) {
     std::ifstream file(path);
     if (!file.is_open())
         throw std::runtime_error("Could not open file: " + path);
@@ -65,7 +74,7 @@ GraphMatrix<Device> load_to_tnl_matrix(const std::string& path, bool weighted = 
     for (auto& [u, v, w] : edges)
         row_capacity[u]++;
 
-    GraphMatrix<TNL::Devices::Host> host_matrix;
+    HostMatrix host_matrix;
     host_matrix.setDimensions(n_nodes, n_nodes);
 
     TNL::Containers::Array<IndexType, TNL::Devices::Host> capacities(n_nodes);
@@ -79,12 +88,12 @@ GraphMatrix<Device> load_to_tnl_matrix(const std::string& path, bool weighted = 
     }
 
     std::cout << "Transferring graph to device...\n";
-    GraphMatrix<Device> device_matrix;
+    DeviceMatrix device_matrix;
     device_matrix = host_matrix;
     return device_matrix;
 }
 
-void checksum_matrix(const GraphMatrix<TNL::Devices::Host>& m) {
+void checksum_matrix(const HostMatrix& m) {
     long long neighbor_sum = 0, edge_count = 0;
     for (int v = 0; v < m.getRows(); v++) {
         auto row = m.getRow(v);
@@ -103,17 +112,14 @@ void checksum_matrix(const GraphMatrix<TNL::Devices::Host>& m) {
 
 // ─── LPA ─────────────────────────────────────────────────────────────────────
 
-template<typename Device>
 TNL::Containers::Array<int, TNL::Devices::Host>
-run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
+run_lpa(DeviceMatrix& matrix, int max_iter = 1000) {
     int n = matrix.getRows();
 
-    TNL::Containers::Array<int, Device> labels(n);
-    TNL::Containers::Array<int, Device> new_labels(n);
-    TNL::Containers::Array<int, Device> changed_flags(n);
+    TNL::Containers::Array<int, TNL::Devices::Cuda> labels(n);
+    TNL::Containers::Array<int, TNL::Devices::Cuda> new_labels(n);
+    TNL::Containers::Array<int, TNL::Devices::Cuda> changed_flags(n);
 
-    // Initialize: each node is its own community.
-    // forAllElements is confirmed safe for both Host and Cuda by the docs.
     labels.forAllElements(
         [] __cuda_callable__ (int i, int& value) { value = i; });
     new_labels.forAllElements(
@@ -128,28 +134,22 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
 
     for (int iter = 0; iter < max_iter; iter++) {
 
-        // labels_view  = read-only source for this iteration (neighbours read this)
-        // new_labels_view = write target (each node writes its new label here)
-        // Both views are stable — no reallocation happens below.
-        TNL::Algorithms::parallelFor<Device>(0, n,
+        TNL::Algorithms::parallelFor<TNL::Devices::Cuda>(0, n,
             [=] __cuda_callable__ (int v) mutable {
-                auto row   = matrix_view.getRow(v);
-                int degree = row.getSize();
+                auto row = matrix_view.getRow(v);
 
-                if (degree == 0) {
-                    new_labels_view[v] = labels_view[v];
-                    changed_view[v]    = 0;
-                    return;
-                }
                 const int MAX_LOCAL_LABELS = 32;
                 int   label_ids   [MAX_LOCAL_LABELS];
                 float label_scores[MAX_LOCAL_LABELS];
                 int   num_labels = 0;
 
-                for (int i = 0; i < degree; i++) {
-                    int   neighbor = row.getColumnIndex(i);
-                    int   lbl      = labels_view[neighbor];
-                    float weight   = row.getValue(i);
+                // SlicedEllpack pads rows to the slice max length; padding
+                // elements have column index -1 and must be skipped.
+                for (int i = 0; i < row.getSize(); i++) {
+                    int neighbor = row.getColumnIndex(i);
+                    if (neighbor < 0) continue;
+                    int   lbl    = labels_view[neighbor];
+                    float weight = row.getValue(i);
 
                     int idx = -1;
                     for (int j = 0; j < num_labels; j++) {
@@ -164,11 +164,12 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
                     }
                 }
 
-                // Deterministic tie-breaking with iter in hash so it varies
-                // each round — prevents oscillation / non-convergence.
-                // Current label gets +0.5 bonus: another label needs strictly
-                // more votes (≥1.0 difference) to cause a switch, so nodes
-                // don't flip on hash noise alone.
+                if (num_labels == 0) {
+                    new_labels_view[v] = labels_view[v];
+                    changed_view[v]    = 0;
+                    return;
+                }
+
                 int   best_label = labels_view[v];
                 float best_score = -1.0f;
 
@@ -177,8 +178,6 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
                                ^ (unsigned(label_ids[i]) * 2246822519u)
                                ^ (unsigned(iter)         * 1234567891u);
                     float final_score = label_scores[i] + (float)(h & 0xFFFF) / 1e7f;
-                    if (label_ids[i] == labels_view[v])
-                        final_score += 0.5f;
 
                     if (final_score > best_score) {
                         best_score = final_score;
@@ -213,21 +212,17 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cout << "Usage: ./tlpa <edge_list_file> [max_rows]\n";
+        std::cout << "Usage: ./tlpa_ellpack <edge_list_file> [max_rows]\n";
         return 1;
     }
-
-    std::string input_file = argv[1];
 
     int max_rows = -1;
     if (argc >= 3)
         max_rows = std::stoi(argv[2]);
     try {
-        using TargetDevice = TNL::Devices::Cuda;
+        auto matrix = load_to_tnl_matrix(argv[1], false, max_rows);
 
-        auto matrix = load_to_tnl_matrix<TargetDevice>(argv[1], false, max_rows);
-
-        GraphMatrix<TNL::Devices::Host> host_matrix;
+        HostMatrix host_matrix;
         host_matrix = matrix;
         checksum_matrix(host_matrix);
 
@@ -252,7 +247,7 @@ int main(int argc, char** argv) {
                 << n_comm << " "
                 << elapsed.count()
                 << std::endl;
-                
+
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << "\n";
         return 1;

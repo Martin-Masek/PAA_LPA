@@ -5,7 +5,7 @@
 #include <map>
 #include <unordered_map>
 #include <queue>
-#include <chrono> 
+#include <chrono>
 
 #include <TNL/Matrices/SparseMatrix.h>
 #include <TNL/Devices/Host.h>
@@ -13,6 +13,7 @@
 #include <TNL/Containers/Array.h>
 #include <TNL/Algorithms/parallelFor.h>
 #include <TNL/Algorithms/reduce.h>
+#include <TNL/Algorithms/scan.h>
 
 using RealType  = float;
 using IndexType = int;
@@ -101,7 +102,21 @@ void checksum_matrix(const GraphMatrix<TNL::Devices::Host>& m) {
     std::cout << "======================\n";
 }
 
-// ─── LPA ─────────────────────────────────────────────────────────────────────
+// ─── Frontier LPA ────────────────────────────────────────────────────────────
+//
+// Optimization over the naive version: instead of processing all n nodes every
+// iteration, we maintain a compact frontier of nodes that are candidates to
+// change.  A node can only change its best label if at least one of its
+// neighbors changed last round, so the frontier for iteration k+1 is exactly
+// the union of neighbor-sets of nodes that changed in iteration k.
+//
+// Per iteration:
+//   1. Run LPA kernel only over frontier (parallelFor over frontier_size).
+//   2. Count changed nodes (reduce over frontier).
+//   3. Push: for each changed node, mark all its neighbors active_next.
+//   4. Compact active_next → frontier via exclusive scan + scatter.
+//
+// First iteration frontier = all nodes (cold start).
 
 template<typename Device>
 TNL::Containers::Array<int, TNL::Devices::Host>
@@ -111,36 +126,47 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
     TNL::Containers::Array<int, Device> labels(n);
     TNL::Containers::Array<int, Device> new_labels(n);
     TNL::Containers::Array<int, Device> changed_flags(n);
+    TNL::Containers::Array<int, Device> frontier(n);
+    TNL::Containers::Array<int, Device> active_next(n);
+    TNL::Containers::Array<int, Device> scan_buf(n);
 
-    // Initialize: each node is its own community.
-    // forAllElements is confirmed safe for both Host and Cuda by the docs.
     labels.forAllElements(
-        [] __cuda_callable__ (int i, int& value) { value = i; });
+        [] __cuda_callable__(int i, int& v) { v = i; });
     new_labels.forAllElements(
-        [] __cuda_callable__ (int i, int& value) { value = i; });
+        [] __cuda_callable__(int i, int& v) { v = i; });
     changed_flags.forAllElements(
-        [] __cuda_callable__ (int i, int& value) { value = 0; });
+        [] __cuda_callable__(int i, int& v) { v = 0; });
+    active_next.forAllElements(
+        [] __cuda_callable__(int i, int& v) { v = 0; });
 
-    auto labels_view     = labels.getView();
-    auto new_labels_view = new_labels.getView();
-    auto changed_view    = changed_flags.getView();
-    auto matrix_view     = matrix.getView();
+    // First frontier = every node.
+    frontier.forAllElements(
+        [] __cuda_callable__(int i, int& v) { v = i; });
+    int frontier_size = n;
+
+    auto labels_view      = labels.getView();
+    auto new_labels_view  = new_labels.getView();
+    auto changed_view     = changed_flags.getView();
+    auto frontier_view    = frontier.getView();
+    auto active_next_view = active_next.getView();
+    auto scan_buf_view    = scan_buf.getView();
+    auto matrix_view      = matrix.getView();
 
     for (int iter = 0; iter < max_iter; iter++) {
 
-        // labels_view  = read-only source for this iteration (neighbours read this)
-        // new_labels_view = write target (each node writes its new label here)
-        // Both views are stable — no reallocation happens below.
-        TNL::Algorithms::parallelFor<Device>(0, n,
-            [=] __cuda_callable__ (int v) mutable {
-                auto row   = matrix_view.getRow(v);
-                int degree = row.getSize();
+        // ── Step 1: LPA over frontier ─────────────────────────────────────────
+        TNL::Algorithms::parallelFor<Device>(0, frontier_size,
+            [=] __cuda_callable__(int fi) mutable {
+                int  v      = frontier_view[fi];
+                auto row    = matrix_view.getRow(v);
+                int  degree = row.getSize();
 
                 if (degree == 0) {
                     new_labels_view[v] = labels_view[v];
                     changed_view[v]    = 0;
                     return;
                 }
+
                 const int MAX_LOCAL_LABELS = 32;
                 int   label_ids   [MAX_LOCAL_LABELS];
                 float label_scores[MAX_LOCAL_LABELS];
@@ -164,11 +190,6 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
                     }
                 }
 
-                // Deterministic tie-breaking with iter in hash so it varies
-                // each round — prevents oscillation / non-convergence.
-                // Current label gets +0.5 bonus: another label needs strictly
-                // more votes (≥1.0 difference) to cause a switch, so nodes
-                // don't flip on hash noise alone.
                 int   best_label = labels_view[v];
                 float best_score = -1.0f;
 
@@ -177,8 +198,6 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
                                ^ (unsigned(label_ids[i]) * 2246822519u)
                                ^ (unsigned(iter)         * 1234567891u);
                     float final_score = label_scores[i] + (float)(h & 0xFFFF) / 1e7f;
-                    if (label_ids[i] == labels_view[v])
-                        final_score += 0.5f;
 
                     if (final_score > best_score) {
                         best_score = final_score;
@@ -190,18 +209,59 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
                 changed_view[v]    = (best_label != labels_view[v]) ? 1 : 0;
             });
 
-        int total_changed = TNL::Algorithms::reduce(changed_flags, TNL::Plus{});
+        // ── Step 2: count changed; update labels for frontier nodes only ──────
+        int total_changed = TNL::Algorithms::reduce<Device>(
+            0, frontier_size,
+            [=] __cuda_callable__(int fi) { return changed_view[frontier_view[fi]]; },
+            TNL::Plus{});
 
-        labels.forAllElements(
-            [=] __cuda_callable__ (int i, int& value) {
-                value = new_labels_view[i];
+        TNL::Algorithms::parallelFor<Device>(0, frontier_size,
+            [=] __cuda_callable__(int fi) mutable {
+                int v = frontier_view[fi];
+                labels_view[v] = new_labels_view[v];
             });
 
         if (iter % 10 == 0 || total_changed == 0) {
-            std::cout << "Iteration " << iter << ": " << total_changed << " nodes changed.\n";
+            std::cout << "Iteration " << iter
+                      << ": " << total_changed << " nodes changed"
+                      << " (frontier=" << frontier_size << ").\n";
         }
 
         if (total_changed == 0) break;
+
+        // ── Step 3: push — neighbors of changed nodes become next frontier ────
+        // Zeroing active_next for all n is a fast GPU memset.
+        active_next.forAllElements(
+            [] __cuda_callable__(int i, int& v) { v = 0; });
+
+        TNL::Algorithms::parallelFor<Device>(0, frontier_size,
+            [=] __cuda_callable__(int fi) mutable {
+                int v = frontier_view[fi];
+                if (!changed_view[v]) return;
+                auto row = matrix_view.getRow(v);
+                for (int i = 0; i < row.getSize(); i++)
+                    // Multiple threads may write 1 to the same cell: safe
+                    // because all writes are idempotent (0→1 only).
+                    active_next_view[row.getColumnIndex(i)] = 1;
+            });
+
+        // ── Step 4: compact active_next → frontier via exclusive scan ─────────
+        int next_frontier_size = TNL::Algorithms::reduce<Device>(
+            0, n,
+            [=] __cuda_callable__(int v) { return active_next_view[v]; },
+            TNL::Plus{});
+
+        // scan_buf = active_next (copy), then scan in-place to get scatter positions.
+        scan_buf = active_next;
+        TNL::Algorithms::inplaceExclusiveScan(scan_buf);
+
+        TNL::Algorithms::parallelFor<Device>(0, n,
+            [=] __cuda_callable__(int v) mutable {
+                if (active_next_view[v])
+                    frontier_view[scan_buf_view[v]] = v;
+            });
+
+        frontier_size = next_frontier_size;
     }
 
     TNL::Containers::Array<int, TNL::Devices::Host> host_labels;
@@ -209,19 +269,18 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
     return host_labels;
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ─── Main ────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cout << "Usage: ./tlpa <edge_list_file> [max_rows]\n";
+        std::cout << "Usage: ./tlpa_frontier <edge_list_file> [max_rows]\n";
         return 1;
     }
-
-    std::string input_file = argv[1];
 
     int max_rows = -1;
     if (argc >= 3)
         max_rows = std::stoi(argv[2]);
+
     try {
         using TargetDevice = TNL::Devices::Cuda;
 
@@ -248,11 +307,11 @@ int main(int argc, char** argv) {
                 comm_map[labels[i]] = n_comm++;
 
         std::cout << "RESULT "
-                << matrix.getRows() << " "
-                << n_comm << " "
-                << elapsed.count()
-                << std::endl;
-                
+                  << matrix.getRows() << " "
+                  << n_comm << " "
+                  << elapsed.count()
+                  << std::endl;
+
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << "\n";
         return 1;
