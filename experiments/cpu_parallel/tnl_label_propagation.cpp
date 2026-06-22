@@ -5,6 +5,7 @@
 #include <map>
 #include <unordered_map>
 #include <queue>
+#include <chrono>
 
 #include <TNL/Matrices/SparseMatrix.h>
 #include <TNL/Devices/Host.h>
@@ -125,10 +126,15 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
     auto changed_view    = changed_flags.getView();
     auto matrix_view     = matrix.getView();
 
+    using Clock = std::chrono::high_resolution_clock;
+    using Dur   = std::chrono::duration<double>;
+    Dur t_phase12{0}, t_phase3{0};
+
     for (int iter = 0; iter < max_iter; iter++) {
 
-        // labels_view  = read-only source for this iteration (neighbours read this)
-        // new_labels_view = write target (each node writes its new label here)
+        // Phase 1+2 fused: vote counting + best-label selection run together
+        // inside one parallelFor — cannot separate per-node like sequential.
+        auto p12_start = Clock::now();
         TNL::Algorithms::parallelFor<Device>(0, n,
             [=] __cuda_callable__ (int v) mutable {
                 auto row   = matrix_view.getRow(v);
@@ -163,12 +169,16 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
                 changed_view[v]    = (best_label != labels_view[v]) ? 1 : 0;
             });
 
+        t_phase12 += Clock::now() - p12_start;
+
+        auto p3_start = Clock::now();
         int total_changed = TNL::Algorithms::reduce(changed_flags, TNL::Plus{});
 
         labels.forAllElements(
             [=] __cuda_callable__ (int i, int& value) {
                 value = new_labels_view[i];
             });
+        t_phase3 += Clock::now() - p3_start;
 
         if (iter % 10 == 0 || total_changed == 0) {
             std::cout << "Iteration " << iter << ": " << total_changed << " nodes changed.\n";
@@ -176,6 +186,11 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
 
         if (total_changed == 0) break;
     }
+
+    std::cout << "\n=== Phase timing (total across all iterations) ===\n";
+    std::cout << "  Phase 1+2 — vote counting + selection: " << t_phase12.count() << " s\n";
+    std::cout << "  Phase 3   — reduce + buffer swap:      " << t_phase3.count()  << " s\n";
+    std::cout << "==================================================\n\n";
 
     TNL::Containers::Array<int, TNL::Devices::Host> host_labels;
     host_labels = labels;
