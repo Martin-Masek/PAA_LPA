@@ -1,0 +1,18 @@
+export CPATH=$HOME/.local/include:$CPATH
+export CPLUS_INCLUDE_PATH=$HOME/.local/include:$CPLUS_INCLUDE_PATH
+
+nvcc -O3 --expt-relaxed-constexpr --extended-lambda -arch=sm_89 --ptxas-options=-v tnl_label_propagation.cu -o tlpa_cuda
+nvcc -O3 --expt-relaxed-constexpr --extended-lambda -arch=sm_89 --ptxas-options=-v bench_max_labels.cu -o bench_max_labels
+g++ -O3 -fopenmp -DHAVE_OPENMP -std=c++17 tnl_label_propagation.cpp -o cputnlc
+
+./tlpa_cuda ./grafy/out.citeseer 100000
+OMP_NUM_THREADS=16 ./cputnlc ./grafy/out.citeseer 100000
+OMP_NUM_THREADS=16 ./cputnlc ./grafy/out.livejournal-groupmemberships 2000000
+./bench_max_labels ./grafy/out.citeseer 100000 1000 | tee bench_max_labels.csv
+
+
+sudo sh -c 'echo 0 > /sys/module/nvidia/parameters/RmProfilingAdminOnly'
+nsys profile --stats=true --force-overwrite true -o lpa_profile ./tlpa_cuda ./grafy/out.citeseer 100000
+/opt/nvidia/nsight-compute/2025.1.0/ncu --set full --launch-count 3 -o lpa_kernel ./tlpa_cuda ./grafy/out.citeseer 100000
+python3 plot_max_labels.py bench_max_labels.csv
+
