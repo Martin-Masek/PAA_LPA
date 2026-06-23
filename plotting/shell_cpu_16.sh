@@ -1,7 +1,7 @@
 #!/bin/bash
 
-EXEC=./cputnl
-GRAPH=out.citeseer
+EXEC=../cputnlc
+GRAPH=../grafy/out.citeseer
 OUTFILE=communities_cpu_16_citeseer_2.txt
 
 

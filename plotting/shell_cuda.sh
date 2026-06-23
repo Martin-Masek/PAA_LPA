@@ -1,7 +1,7 @@
 #!/bin/bash
 
-EXEC=./tlpa_cuda
-GRAPH=out.citeseer
+EXEC=../tlpa_cuda
+GRAPH=../grafy/out.citeseer
 OUTFILE=communities_cuda_citeseer_2.txt
 
 echo "#nodes communities lpa_seconds" > $OUTFILE

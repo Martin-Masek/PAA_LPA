@@ -1,7 +1,7 @@
 #!/bin/bash
 
-EXEC=./cputnl
-GRAPH=out.livejournal-groupmemberships
+EXEC=../cputnlc
+GRAPH=../grafy/out.livejournal-groupmemberships
 OUTFILE=cpu_thread_scaling.txt
 NODES=500000
 
