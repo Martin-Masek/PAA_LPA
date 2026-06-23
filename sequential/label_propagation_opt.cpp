@@ -94,16 +94,6 @@ void print_graph_stats(const CSRGraph& g) {
     std::cout << "  Avg degree: " << avg_degree << "\n\n";
 }
 
-// Optimized LPA — three bottlenecks fixed vs label_propagation.cpp:
-//
-// 1. scores map: moved outside per-node loop; .clear() reuses the allocation
-//    instead of malloc/free on every node every iteration.
-//
-// 2. candidates vector: eliminated entirely. Reservoir sampling selects a
-//    random tied winner in a single pass (same distribution, zero allocation).
-//
-// 3. Community count: removed from the inner iteration loop; computed once
-//    at the end. The per-iteration log now shows changed count only.
 std::vector<int> label_propagation(const CSRGraph& g, int max_iter = 1000,
                                     unsigned seed = 42) {
     std::vector<int> labels(g.n_nodes);
@@ -127,13 +117,10 @@ std::vector<int> label_propagation(const CSRGraph& g, int max_iter = 1000,
                 continue;
             }
 
-            // FIX 1: clear instead of destroy+create.
             scores.clear();
             for (int i = nbr_start; i < nbr_end; i++)
                 scores[labels[g.neighbors[i]]] += g.weights[i];
 
-            // FIX 2: two-pass tie-breaking — same RNG consumption as original
-            // (one draw per node), so results are identical given the same seed.
             float best_score = -1.0f;
             int   tie_count  = 0;
             for (auto& [lbl, score] : scores) {

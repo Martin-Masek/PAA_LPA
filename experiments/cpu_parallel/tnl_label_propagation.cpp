@@ -113,7 +113,6 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
     TNL::Containers::Array<int, Device> changed_flags(n);
 
     // Initialize: each node is its own community.
-    // forAllElements is confirmed safe for both Host and Cuda by the docs.
     labels.forAllElements(
         [] __cuda_callable__ (int i, int& value) { value = i; });
     new_labels.forAllElements(
@@ -132,8 +131,6 @@ run_lpa(GraphMatrix<Device>& matrix, int max_iter = 1000) {
 
     for (int iter = 0; iter < max_iter; iter++) {
 
-        // Phase 1+2 fused: vote counting + best-label selection run together
-        // inside one parallelFor — cannot separate per-node like sequential.
         auto p12_start = Clock::now();
         TNL::Algorithms::parallelFor<Device>(0, n,
             [=] __cuda_callable__ (int v) mutable {
