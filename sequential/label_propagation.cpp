@@ -10,19 +10,6 @@
 #include <map>
 #include <chrono>
 
-// ---------------------------------------------------------------------------
-// CSR (Compressed Sparse Row) graph representation
-//
-// Stores the adjacency list of an undirected graph in two flat arrays:
-//   offsets[v]..offsets[v+1]  — half-open range of neighbor indices for node v
-//   neighbors[i]              — target node of the i-th edge
-//   weights[i]                — weight of the i-th edge (1.0 for unweighted)
-//
-// Memory layout is cache-friendly for sequential traversal of one node's
-// neighbors, but accessing neighbors of different nodes in parallel causes
-// irregular (non-coalesced) memory accesses — a key motivation for GPU
-// optimizations.
-// ---------------------------------------------------------------------------
 struct CSRGraph {
     int n_nodes;
     std::vector<int>   offsets;
@@ -96,37 +83,6 @@ void print_graph_stats(const CSRGraph& g) {
               << "avg degree " << avg_deg / g.n_nodes << "\n\n";
 }
 
-// ---------------------------------------------------------------------------
-// Label Propagation Algorithm — synchronous (double-buffered) variant
-//
-// Algorithm overview:
-//   Initialisation: each node v gets a unique label  labels[v] = v
-//
-//   Each iteration consists of three sequential phases:
-//
-//   Phase 1 — Label vote counting  (dominates runtime, O(m) per iteration)
-//     For every node v, traverse all neighbours and accumulate the total
-//     weight of votes for each distinct label seen among them.
-//     This is stored in a per-node hash map: label → accumulated weight.
-//     → This phase is EMBARRASSINGLY PARALLEL: each node's computation
-//       reads only labels[] (shared, read-only this iteration) and writes
-//       only new_labels[v] (private slot). No data races exist.
-//       The GPU implementation replaces this loop with parallelFor<Cuda>.
-//
-//   Phase 2 — Best-label selection  (O(distinct labels per node))
-//     Pick the label with the highest accumulated weight. Break ties by
-//     random selection (one rng() draw among tied candidates).
-//     → Also per-node independent; parallelised on GPU alongside Phase 1.
-//
-//   Phase 3 — Synchronous buffer swap  (O(n))
-//     Swap labels ↔ new_labels so every node sees the same label snapshot
-//     for the next iteration (synchronous / Jacobi-style update).
-//     → Sequential O(n) memcpy; on GPU done via forAllElements<Cuda>.
-//
-//   Convergence: stop when no node changed its label, or max_iter reached.
-//
-// Complexity: O(max_iter × m)  where m = number of edges
-// ---------------------------------------------------------------------------
 std::vector<int> label_propagation(const CSRGraph& g, int max_iter = 1000,
                                     unsigned seed = 42) {
     std::vector<int> labels(g.n_nodes);

@@ -104,7 +104,7 @@ void print_graph_stats(const CSRGraph& g) {
 //
 // 3. Community count: removed from the inner iteration loop; computed once
 //    at the end. The per-iteration log now shows changed count only.
-std::vector<int> label_propagation(const CSRGraph& g, int max_iter = 300,
+std::vector<int> label_propagation(const CSRGraph& g, int max_iter = 1000,
                                     unsigned seed = 42) {
     std::vector<int> labels(g.n_nodes);
     std::iota(labels.begin(), labels.end(), 0);
@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
     print_graph_stats(g);
 
     auto t0 = std::chrono::high_resolution_clock::now();
-    auto labels = label_propagation(g, 300, 42);
+    auto labels = label_propagation(g, 1000, 42);
     auto t1 = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = t1 - t0;
 
